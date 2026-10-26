@@ -240,3 +240,9 @@ API mode uses the OS TLS stack on Windows and macOS (SChannel / Security.framewo
 3. Only when every target builds are the `v<version>` tag and the GitHub Release created, with the archives, `SHA256SUMS` and the install scripts attached
 
 Targets (`.github/workflows/reusable-build-matrix.yml`): macOS (arm64 / x86_64), Windows (x64 / ARM64), Linux (x86_64 / aarch64, glibc and musl). **Actions → build-check** builds them all without publishing. Versions with a hyphen, like `1.0.0-beta.1`, become pre-releases and are skipped by the install scripts' "latest". When the repository is public, releases also get build provenance attestations.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE). Copyright 2026 Igarin.
+
+This project is not affiliated with, endorsed by, or sponsored by Google. "Google", "Gemini" and "Google AI Studio" are trademarks of Google LLC.

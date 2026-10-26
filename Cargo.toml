@@ -2,7 +2,8 @@
 name = "aistudio"
 version = "0.1.0"
 edition = "2024"
-description = "Chat with Gemini from your terminal, with the same run settings as Google AI Studio"
+description = "Google AI Studio's chat in your terminal (unofficial, experimental)"
+license = "Apache-2.0"
 repository = "https://github.com/igarinpiano/ai-studio-cli"
 
 [dependencies]
