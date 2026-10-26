@@ -27,8 +27,10 @@ use crate::web::{WebOptions, WebSession};
 #[command(
     name = "aistudio",
     version,
-    about = "Google AI Studio's chat in your terminal.",
+    about = "Google AI Studio's chat in your terminal (unofficial, experimental).",
     long_about = "Google AI Studio's chat in your terminal.\n\n\
+        Unofficial and experimental: not affiliated with or endorsed by Google.\n\
+        Use at your own risk.\n\n\
         By default it drives the real AI Studio web app in your own browser (Chrome,\n\
         Edge, Chromium or Brave), signed in with your Google account: run\n\
         `aistudio login` once. --api uses the Gemini API with an API key instead.\n\n\

@@ -826,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn japanese_text_passes_through() {
-        assert_eq!(strip(&render_chunks(&["こんにちは、", "**世界**！\n"])), "こんにちは、世界！\n");
+    fn multibyte_text_passes_through() {
+        assert_eq!(strip(&render_chunks(&["Grüße, ", "**naïve café** ✓\n"])), "Grüße, naïve café ✓\n");
     }
 }

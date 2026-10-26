@@ -57,22 +57,22 @@
     sourceLinks: ['ms-grounding-sources a[href]', 'ms-search-entry-point a[href]', '.grounding-sources a[href]'],
   };
   const LABEL = {
-    runSettings: /^(Run settings|実行設定)$/i,
-    tools: /^(Tools|ツール)$/i,
-    advanced: /^(Advanced settings|詳細設定)$/i,
-    thinking: /^(Thinking level|Thinking|思考レベル)$/i,
-    media: /^(Media resolution|メディア解像度)$/i,
-    system: /^(System instructions|システム指示)$/i,
-    temperature: /^(Temperature|温度)$/i,
-    top_p: /^(Top P|Top-P|トップ P)$/i,
-    output_length: /^(Output length|Max output tokens|出力の長さ)$/i,
-    stop: /^(Add stop sequence|Stop sequence|停止シーケンス)/i,
-    search: /^(Grounding with Google Search|Google Search|Google 検索.*グラウンディング)$/i,
-    maps: /^(Grounding with Google Maps|Google Maps|Google マップ.*グラウンディング)$/i,
-    url_context: /^(URL context|URL コンテキスト)$/i,
-    code_execution: /^(Code execution|コード実行)$/i,
-    structured_output: /^(Structured outputs?|構造化出力)$/i,
-    function_calling: /^(Function calling|関数呼び出し)$/i,
+    runSettings: /^Run settings$/i,
+    tools: /^Tools$/i,
+    advanced: /^Advanced settings$/i,
+    thinking: /^(Thinking level|Thinking)$/i,
+    media: /^Media resolution$/i,
+    system: /^System instructions$/i,
+    temperature: /^Temperature$/i,
+    top_p: /^(Top P|Top-P)$/i,
+    output_length: /^(Output length|Max output tokens)$/i,
+    stop: /^(Add stop sequence|Stop sequence)/i,
+    search: /^(Grounding with Google Search|Google Search)$/i,
+    maps: /^(Grounding with Google Maps|Google Maps)$/i,
+    url_context: /^URL context$/i,
+    code_execution: /^Code execution$/i,
+    structured_output: /^Structured outputs?$/i,
+    function_calling: /^Function calling$/i,
   };
   const MODEL_ID = /\b((?:gemini|gemma|learnlm|imagen|veo|lyria)-[a-z0-9][a-z0-9.\-]*)/i;
 
@@ -156,8 +156,8 @@
 
   const promptBox = () => first(SEL.prompt);
   const runButton = () =>
-    first(SEL.runButton, null, (b) => /run|stop|実行|停止/i.test(text(b) + ' ' + (b.getAttribute('aria-label') || '')));
-  const isStop = (b) => !!b && /\bstop\b|停止/i.test(text(b) + ' ' + (b.getAttribute('aria-label') || ''));
+    first(SEL.runButton, null, (b) => /run|stop/i.test(text(b) + ' ' + (b.getAttribute('aria-label') || '')));
+  const isStop = (b) => !!b && /\bstop\b/i.test(text(b) + ' ' + (b.getAttribute('aria-label') || ''));
 
   const turns = () => {
     for (const s of SEL.turn) {
@@ -452,7 +452,7 @@
       if (/accounts\.google\.com/.test(location.host)) return { state: 'login', url };
       const dialog = dialogText();
       if (promptBox()) return { state: dialog ? 'dialog' : 'ready', url, dialog };
-      if (/sign in|ログイン/i.test(text(document.body).slice(0, 2000)) && !turns().length) return { state: 'login', url };
+      if (/sign in/i.test(text(document.body).slice(0, 2000)) && !turns().length) return { state: 'login', url };
       return { state: 'loading', url, dialog };
     },
 
@@ -593,7 +593,7 @@
       if (!label) return { ok: false, error: 'could not find System instructions' };
       const prompt = promptBox();
       const findBox = () =>
-        $all('textarea').find((t) => visible(t) && t !== prompt && /system|instruction|tone|style|指示/i.test((t.getAttribute('aria-label') || '') + ' ' + (t.placeholder || '')))
+        $all('textarea').find((t) => visible(t) && t !== prompt && /system|instruction|tone|style/i.test((t.getAttribute('aria-label') || '') + ' ' + (t.placeholder || '')))
         || first(SEL.dialog) && $all('textarea', first(SEL.dialog)).find(visible);
       let box = findBox();
       if (!box) {
@@ -608,7 +608,7 @@
       await sleep(150);
       const dialog = first(SEL.dialog);
       if (dialog) {
-        const close = $all('button', dialog).find((b) => /close|done|save|閉じる|完了|保存/i.test(text(b) + ' ' + (b.getAttribute('aria-label') || '')));
+        const close = $all('button', dialog).find((b) => /close|done|save/i.test(text(b) + ' ' + (b.getAttribute('aria-label') || '')));
         if (close) click(close);
         else pressKey(box, 'Escape');
       }
@@ -654,7 +654,7 @@
       if (!b) return { ok: false, error: 'could not find the add-files button' };
       click(b);
       await sleep(300);
-      const item = optionsOpen().find((o) => /upload|computer|アップロード/i.test(text(o)));
+      const item = optionsOpen().find((o) => /upload|computer/i.test(text(o)));
       if (item) click(item);
       return { ok: true };
     },
