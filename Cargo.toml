@@ -1,0 +1,40 @@
+[package]
+name = "aistudio"
+version = "0.1.0"
+edition = "2024"
+description = "Chat with Gemini from your terminal, with the same run settings as Google AI Studio"
+repository = "https://github.com/igarinpiano/ai-studio-cli"
+
+[dependencies]
+anstream = "1.0.0"
+anstyle = "1.0.14"
+base64 = "0.23.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+clap = { version = "4.6.7", features = ["derive"] }
+ctrlc = "3.5.2"
+dirs = "7.0.0"
+mime_guess = "2.0.5"
+rpassword = "7.5.4"
+rustyline = "19.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy", "parsing"] }
+
+# TLS: the OS stack on Windows (SChannel) and macOS (Security.framework), which
+# also trusts certificates the OS trusts and needs no C toolchain; rustls with
+# ring elsewhere (static-friendly, cross-compiles cleanly).
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "charset", "http2", "system-proxy", "native-tls"] }
+
+[target.'cfg(not(any(windows, target_os = "macos")))'.dependencies]
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "charset", "http2", "system-proxy", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+[[bin]]
+name = "aistudio"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
