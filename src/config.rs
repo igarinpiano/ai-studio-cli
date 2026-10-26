@@ -27,6 +27,21 @@ pub struct Config {
     /// "markdown" or "raw".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub render: Option<String>,
+    /// "web" (default: drive AI Studio in a browser) or "api" (Gemini API key).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Web: run settings to apply to AI Studio at start (`/settings save`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_settings: Option<RunSettings>,
+    /// Web: browser executable (default: Chrome, Edge, Chromium or Brave, whichever is found).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser: Option<String>,
+    /// Web: run the browser without a window (default true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headless: Option<bool>,
+    /// Input keybindings: "vi" or "emacs" (default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edit_mode: Option<String>,
 }
 
 pub fn app_home() -> PathBuf {

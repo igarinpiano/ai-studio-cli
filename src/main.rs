@@ -7,6 +7,7 @@ mod conversation;
 mod render;
 mod repl;
 mod settings;
+mod web;
 
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
@@ -18,17 +19,23 @@ use serde_json::{Value, json};
 use crate::api::Client;
 use crate::config::{Config, mask_key};
 use crate::conversation::{Chat, file_part};
+use crate::repl::{Engine, WebEngine};
 use crate::settings::RunSettings;
+use crate::web::{WebOptions, WebSession};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "aistudio",
     version,
-    about = "Chat with Gemini from your terminal, with Google AI Studio's run settings.",
-    long_about = "Chat with Gemini from your terminal, with Google AI Studio's run settings.\n\n\
+    about = "Google AI Studio's chat in your terminal.",
+    long_about = "Google AI Studio's chat in your terminal.\n\n\
+        By default it drives the real AI Studio web app in your own browser (Chrome,\n\
+        Edge, Chromium or Brave), signed in with your Google account: run\n\
+        `aistudio login` once. --api uses the Gemini API with an API key instead.\n\n\
         Without a prompt, starts an interactive chat. With a prompt (or piped stdin),\n\
         prints one answer and exits.\n\n\
         Examples:\n  \
+        aistudio login\n  \
         aistudio\n  \
         aistudio \"Explain RAII in two sentences\"\n  \
         cat main.rs | aistudio -t high \"Review this code\"\n  \
@@ -127,20 +134,52 @@ struct Cli {
     /// Stay in interactive chat after answering the prompt
     #[arg(short, long)]
     interactive: bool,
+    /// Use the Gemini API (API key) instead of the AI Studio web app
+    #[arg(long, conflicts_with = "web")]
+    api: bool,
+    /// Use the AI Studio web app in your browser (the default)
+    #[arg(long)]
+    web: bool,
+    /// Web: show the browser window instead of running it in the background
+    #[arg(long)]
+    headed: bool,
+    /// Vim keybindings for the input line (this session; /vim saves it)
+    #[arg(long, conflicts_with = "emacs")]
+    vim: bool,
+    /// Emacs keybindings for the input line (this session)
+    #[arg(long)]
+    emacs: bool,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// List models available to your API key
+    /// List the models you can use
     Models {
-        /// Print the raw JSON
+        /// Print JSON lines
         #[arg(long)]
         json: bool,
+        /// Ask the Gemini API instead of AI Studio
+        #[arg(long)]
+        api: bool,
     },
-    /// Save an API key to the config file
-    Login,
-    /// Remove the saved API key
-    Logout,
+    /// Sign in to Google in a browser window (or, with --api, save an API key)
+    Login {
+        /// Save a Gemini API key instead
+        #[arg(long)]
+        api: bool,
+    },
+    /// Sign out: delete the browser profile (or, with --api, the saved API key)
+    Logout {
+        /// Remove the saved API key instead
+        #[arg(long)]
+        api: bool,
+    },
+    /// Save a screenshot and the HTML of the AI Studio page, for troubleshooting
+    Debug {
+        /// Show the browser window
+        #[arg(long)]
+        headed: bool,
+    },
     /// Show config location and saved defaults
     Config,
     /// List saved chats
@@ -165,13 +204,11 @@ fn run(cli: Cli) -> Result<u8, String> {
         return subcommand(cmd, &mut cfg);
     }
 
-    let mut chat = if cli.cont || cli.resume.is_some() {
+    let chat = if cli.cont || cli.resume.is_some() {
         conversation::find_chat(cli.resume.as_deref().unwrap_or("last"))?
     } else {
         Chat::new(&cfg.settings)
     };
-    let mut settings = if chat.contents.is_empty() { cfg.settings.clone() } else { chat.settings.clone() };
-    apply_flags(&cli, &mut settings)?;
 
     let mut prompt = cli.prompt.join(" ");
     let stdin = std::io::stdin();
@@ -183,11 +220,145 @@ fn run(cli: Cli) -> Result<u8, String> {
         }
     }
     let one_shot = !prompt.trim().is_empty() || !cli.files.is_empty();
+    if !one_shot && !std::io::stdin().is_terminal() {
+        return Err("nothing to send: give a prompt or pipe text on stdin".into());
+    }
 
+    let pretty = if cli.raw {
+        false
+    } else if cli.markdown {
+        true
+    } else {
+        std::io::stdout().is_terminal() && cfg.render.as_deref() != Some("raw")
+    };
+    let vim = cli.vim || (!cli.emacs && cfg.edit_mode.as_deref() == Some("vi"));
+    let use_api = cli.api || (!cli.web && cfg.backend.as_deref() == Some("api"));
+
+    if use_api {
+        run_api(&cli, cfg, chat, prompt, one_shot, pretty, vim)
+    } else {
+        run_web(&cli, cfg, chat, prompt, one_shot, pretty, vim)
+    }
+}
+
+fn web_options(cfg: &Config, headed: bool) -> WebOptions {
+    WebOptions { browser: cfg.browser.clone(), headless: !headed && cfg.headless.unwrap_or(true) }
+}
+
+/// Start the browser and open AI Studio (a saved chat's page, or a new chat).
+fn open_web(cfg: &Config, headed: bool, url: &str) -> Result<WebSession, String> {
+    if std::io::stderr().is_terminal() {
+        render::err(&render::paint(render::dim(), "Opening AI Studio…\r"));
+    }
+    let mut session = WebSession::start(&web_options(cfg, headed))?;
+    let opened = session.navigate(url);
+    if std::io::stderr().is_terminal() {
+        render::err("                  \r");
+    }
+    match opened {
+        Ok(()) => Ok(session),
+        Err(e) => {
+            session.close();
+            Err(e)
+        }
+    }
+}
+
+fn run_web(
+    cli: &Cli,
+    cfg: Config,
+    mut chat: Chat,
+    prompt: String,
+    one_shot: bool,
+    pretty: bool,
+    vim: bool,
+) -> Result<u8, String> {
+    let url = if chat.contents.is_empty() {
+        web::home_url()
+    } else {
+        chat.web_url.clone().ok_or("That chat was made with the API engine; continue it with --api.")?
+    };
+    let mut session = open_web(&cfg, cli.headed, &url)?;
+    let page = session.read_settings(&RunSettings::default());
+    let mut settings = match &cfg.web_settings {
+        Some(saved) if chat.contents.is_empty() => saved.clone(),
+        _ => page.clone(),
+    };
+    if let Err(e) = apply_flags(cli, &mut settings) {
+        session.close();
+        return Err(e);
+    }
+
+    if one_shot {
+        for w in session.apply_settings(&page, &settings) {
+            render::warn(&format!("AI Studio: {w}"));
+        }
+        if let Err(e) = session.attach(&cli.files) {
+            session.close();
+            return Err(format!("could not attach files: {e}"));
+        }
+        let turn = match session.send(&prompt, pretty, settings.include_thoughts, &settings.model) {
+            Ok(t) => t,
+            Err(e) => {
+                render::error(&format!("Error: {e}"));
+                session.close();
+                return Ok(1);
+            }
+        };
+        let mut parts: Vec<Value> = Vec::new();
+        if !prompt.trim().is_empty() {
+            parts.push(json!({ "text": prompt }));
+        }
+        parts.extend(cli.files.iter().map(|f| json!({ "text": format!("[attachment: {}]", f.display()) })));
+        chat.contents.push(json!({ "role": "user", "parts": parts }));
+        if !turn.text.is_empty() {
+            chat.contents.push(json!({ "role": "model", "parts": [ { "text": turn.text } ] }));
+        }
+        if turn.url.contains("/prompts/") && !turn.url.contains("new_chat") {
+            chat.web_url = Some(turn.url.clone());
+        }
+        if let Err(e) = chat.save(&settings) {
+            render::warn(&format!("could not save chat: {e}"));
+        }
+        if !cli.interactive {
+            session.close();
+            return Ok(if turn.result.interrupted {
+                130
+            } else if turn.text.is_empty() {
+                1
+            } else {
+                0
+            });
+        }
+        if !std::io::stdin().is_terminal() {
+            session.close();
+            return Err("--interactive needs a terminal on stdin".into());
+        }
+        let engine = Engine::Web(Box::new(WebEngine { session, page: Some(settings.clone()) }));
+        let mut r = repl::Repl::new(engine, cfg, settings, chat, pretty, vim).map_err(|e| e.to_string())?;
+        return Ok(r.run(false) as u8);
+    }
+
+    let engine = Engine::Web(Box::new(WebEngine { session, page: Some(page) }));
+    let mut r = repl::Repl::new(engine, cfg, settings, chat, pretty, vim).map_err(|e| e.to_string())?;
+    Ok(r.run(true) as u8)
+}
+
+fn run_api(
+    cli: &Cli,
+    mut cfg: Config,
+    mut chat: Chat,
+    prompt: String,
+    one_shot: bool,
+    pretty: bool,
+    vim: bool,
+) -> Result<u8, String> {
+    let mut settings = if chat.contents.is_empty() { cfg.settings.clone() } else { chat.settings.clone() };
+    apply_flags(cli, &mut settings)?;
     let key = match cfg.resolve_api_key() {
         Some((k, _)) => k,
         None if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() => {
-            render::out("No API key found (GEMINI_API_KEY or `aistudio login`).\n");
+            render::out("No API key found (GEMINI_API_KEY or `aistudio login --api`).\n");
             let k = repl::prompt_api_key().ok_or("an API key is required")?;
             cfg.api_key = Some(k.clone());
             match cfg.save() {
@@ -197,18 +368,10 @@ fn run(cli: Cli) -> Result<u8, String> {
             k
         }
         None => {
-            return Err("No API key. Set GEMINI_API_KEY, or run `aistudio login`.\nGet one at https://aistudio.google.com/apikey".into());
+            return Err("No API key. Set GEMINI_API_KEY, or run `aistudio login --api`.\nGet one at https://aistudio.google.com/apikey".into());
         }
     };
     let client = Client::new(key).map_err(|e| e.to_string())?;
-
-    let pretty = if cli.raw {
-        false
-    } else if cli.markdown {
-        true
-    } else {
-        std::io::stdout().is_terminal() && cfg.render.as_deref() != Some("raw")
-    };
 
     if one_shot {
         let mut parts: Vec<Value> = Vec::new();
@@ -249,15 +412,13 @@ fn run(cli: Cli) -> Result<u8, String> {
         if !std::io::stdin().is_terminal() {
             return Err("--interactive needs a terminal on stdin".into());
         }
-        let mut r = repl::Repl::new(client, cfg, settings, chat, pretty).map_err(|e| e.to_string())?;
+        let mut r =
+            repl::Repl::new(Engine::Api(client), cfg, settings, chat, pretty, vim).map_err(|e| e.to_string())?;
         // The answer is already on screen; don't print it again.
         return Ok(r.run(false) as u8);
     }
 
-    if !std::io::stdin().is_terminal() {
-        return Err("nothing to send: give a prompt or pipe text on stdin".into());
-    }
-    let mut r = repl::Repl::new(client, cfg, settings, chat, pretty).map_err(|e| e.to_string())?;
+    let mut r = repl::Repl::new(Engine::Api(client), cfg, settings, chat, pretty, vim).map_err(|e| e.to_string())?;
     Ok(r.run(true) as u8)
 }
 
@@ -322,7 +483,22 @@ fn apply_flags(cli: &Cli, s: &mut RunSettings) -> Result<(), String> {
 
 fn subcommand(cmd: &Command, cfg: &mut Config) -> Result<u8, String> {
     match cmd {
-        Command::Login => {
+        Command::Login { api: false } => {
+            web::interactive_login(&web_options(cfg, true))?;
+            render::out("Checking the sign-in…\n");
+            let session = open_web(cfg, false, &web::home_url());
+            match session {
+                Ok(s) => {
+                    s.close();
+                    render::success("Signed in. Run `aistudio` to chat.");
+                    Ok(0)
+                }
+                Err(e) => Err(format!(
+                    "{e}\nIf you did sign in, try `aistudio --headed` (some accounts don't work with a hidden browser)."
+                )),
+            }
+        }
+        Command::Login { api: true } => {
             let key = repl::prompt_api_key().ok_or("no key entered")?;
             let client = Client::new(key.clone()).map_err(|e| e.to_string())?;
             match client.list_models() {
@@ -334,7 +510,15 @@ fn subcommand(cmd: &Command, cfg: &mut Config) -> Result<u8, String> {
             render::success(&format!("Saved to {}", path.display()));
             Ok(0)
         }
-        Command::Logout => {
+        Command::Logout { api: false } => {
+            let dir = web::browser::profile_dir();
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir).map_err(|e| format!("cannot remove {}: {e}", dir.display()))?;
+            }
+            render::success(&format!("Removed the browser profile ({}); you are signed out here.", dir.display()));
+            Ok(0)
+        }
+        Command::Logout { api: true } => {
             cfg.api_key = None;
             let path = cfg.save().map_err(|e| format!("could not save config: {e}"))?;
             render::success(&format!("Removed the API key from {}", path.display()));
@@ -371,10 +555,33 @@ fn subcommand(cmd: &Command, cfg: &mut Config) -> Result<u8, String> {
             }
             Ok(0)
         }
-        Command::Models { json } => {
-            let (key, _) = cfg.resolve_api_key().ok_or("No API key. Set GEMINI_API_KEY, or run `aistudio login`.")?;
-            let client = Client::new(key).map_err(|e| e.to_string())?;
-            let models = client.list_models().map_err(|e| e.to_string())?;
+        Command::Debug { headed } => {
+            let mut session = WebSession::start(&web_options(cfg, *headed))?;
+            if let Err(e) = session.navigate(&web::home_url()) {
+                render::warn(&e);
+            }
+            let dir = session.debug_dump();
+            session.close();
+            let dir = dir?;
+            render::success(&format!(
+                "Saved screenshot.png, page.html, outline.txt and state.json to {}\n(They may contain your chats; check before sharing.)",
+                dir.display()
+            ));
+            Ok(0)
+        }
+        Command::Models { json, api } => {
+            let use_api = *api || cfg.backend.as_deref() == Some("api");
+            let models = if use_api {
+                let (key, _) =
+                    cfg.resolve_api_key().ok_or("No API key. Set GEMINI_API_KEY, or run `aistudio login --api`.")?;
+                let client = Client::new(key).map_err(|e| e.to_string())?;
+                client.list_models().map_err(|e| e.to_string())?
+            } else {
+                let mut session = open_web(cfg, false, &web::home_url())?;
+                let models = session.list_models();
+                session.close();
+                models?
+            };
             for m in models.iter().filter(|m| m.can_chat()) {
                 if *json {
                     render::out(&format!(

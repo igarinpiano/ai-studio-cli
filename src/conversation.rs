@@ -202,6 +202,9 @@ pub struct Chat {
     pub updated: String,
     pub settings: RunSettings,
     pub contents: Vec<Value>,
+    /// Web: the chat's page in AI Studio (it saves chats to your Drive).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_url: Option<String>,
 }
 
 impl Chat {
@@ -214,6 +217,7 @@ impl Chat {
             updated: now.to_rfc3339(),
             settings: settings.clone(),
             contents: Vec::new(),
+            web_url: None,
         }
     }
 

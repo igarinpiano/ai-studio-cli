@@ -19,6 +19,7 @@ rustyline = "19.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy", "parsing"] }
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 
 # TLS: the OS stack on Windows (SChannel) and macOS (Security.framework), which
 # also trusts certificates the OS trusts and needs no C toolchain; rustls with

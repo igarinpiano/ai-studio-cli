@@ -1,32 +1,37 @@
 //! Interactive chat: the Playground screen of AI Studio, in a terminal.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anstyle::AnsiColor;
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
+use rustyline::config::Configurer;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
-use rustyline::{Cmd, Config as RlConfig, Context, Editor, Helper, KeyCode, KeyEvent, Modifiers};
+use rustyline::{
+    Cmd, ConditionalEventHandler, Config as RlConfig, Context, EditMode, Editor, Event, EventContext, EventHandler,
+    Helper, InputMode, KeyCode, KeyEvent, Modifiers, RepeatCount,
+};
 use serde_json::{Value, json};
 
-use crate::api::{ApiError, Client, ModelInfo};
+use crate::api::{ApiError, Client, DEFAULT_BASE_URL, ModelInfo};
 use crate::chat::run_turn;
 use crate::config::{self, Config};
 use crate::conversation::{self, Chat, file_part, list_chats};
 use crate::render::{self, MdStream, dim, fg, paint};
 use crate::settings::{self, KEYS, RunSettings, SAFETY_CATEGORIES, THINKING_LEVELS, normalize_key, truncate};
+use crate::web::WebSession;
 
 /// (command, arguments, description)
 const COMMANDS: &[(&str, &str, &str)] = &[
     ("/help", "", "Show this help"),
     ("/new", "", "Start a new chat (alias: /clear)"),
     ("/model", "[name|number]", "Switch model (no argument: pick from list)"),
-    ("/models", "", "List models available to your API key"),
+    ("/models", "", "List the models you can use"),
     ("/thinking", "[level|budget]", "Thinking level: default, minimal, low, medium, high, off, dynamic, <tokens>"),
     ("/thoughts", "[on|off]", "Show thought summaries"),
     ("/system", "[text|clear]", "System instructions (no argument: multi-line editor)"),
@@ -53,8 +58,11 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("/load", "<number|id>", "Open a saved chat"),
     ("/rename", "<title>", "Rename this chat"),
     ("/export", "<file.md|file.json>", "Export this chat"),
+    ("/edit", "", "Write the next message in $EDITOR (also `v` in vi normal mode)"),
+    ("/vim", "[on|off]", "Vim keybindings for the input line (saved)"),
     ("/code", "", "Show the equivalent API request (Get code)"),
-    ("/key", "", "Set the API key"),
+    ("/debug", "", "Web: save a screenshot and the page's HTML for troubleshooting"),
+    ("/key", "", "Set the API key (for --api)"),
     ("/render", "<markdown|raw>", "Output style"),
     ("/exit", "", "Quit (also Ctrl+D)"),
 ];
@@ -84,7 +92,7 @@ impl Completer for ReplHelper {
             let mut out: Vec<Pair> = COMMANDS
                 .iter()
                 .map(|(c, _, _)| *c)
-                .chain(["/clear", "/quit", "/topp", "/topk", "/thinking"])
+                .chain(["/clear", "/quit", "/topp", "/topk", "/thinking", "/emacs"])
                 .filter(|c| c.starts_with(before))
                 .map(pair)
                 .collect();
@@ -116,6 +124,7 @@ impl Completer for ReplHelper {
             "/safety" => ["off", "none", "high", "medium", "low", "default"].iter().map(|s| s.to_string()).collect(),
             "/media" => settings::MEDIA_RESOLUTIONS.iter().map(|s| s.to_string()).collect(),
             "/render" => vec!["markdown".into(), "raw".into()],
+            "/edit" | "/debug" => Vec::new(),
             "/settings" => vec!["save".into(), "reset".into()],
             "/load" => list_chats().into_iter().map(|(_, c)| c.id).collect(),
             _ => vec!["on".into(), "off".into()],
@@ -124,17 +133,63 @@ impl Completer for ReplHelper {
     }
 }
 
+/// Where prompts go: the AI Studio page in a browser, or the Gemini API.
+pub enum Engine {
+    Api(Client),
+    Web(Box<WebEngine>),
+}
+
+pub struct WebEngine {
+    pub session: WebSession,
+    /// The page's run settings as last read or applied; `None` after it
+    /// navigated, so they are read again before the next message.
+    pub page: Option<RunSettings>,
+}
+
+impl Engine {
+    pub fn close(self) {
+        if let Engine::Web(w) = self {
+            let w = *w;
+            w.session.close();
+        }
+    }
+}
+
+/// A file to send with the next message.
+struct Attachment {
+    name: String,
+    path: PathBuf,
+    /// Inline data for the API engine.
+    part: Option<Value>,
+}
+
+/// `v` in vi normal mode: hand the line to $EDITOR (as in bash and zsh).
+struct EditInEditor(Arc<Mutex<Option<String>>>);
+
+impl ConditionalEventHandler for EditInEditor {
+    fn handle(&self, _: &Event, _: RepeatCount, _: bool, ctx: &EventContext) -> Option<Cmd> {
+        if ctx.mode() != EditMode::Vi || ctx.input_mode() != InputMode::Command {
+            return None;
+        }
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(ctx.line().to_string());
+        }
+        Some(Cmd::AcceptLine)
+    }
+}
+
 pub struct Repl {
-    client: Client,
+    engine: Option<Engine>,
     cfg: Config,
     settings: RunSettings,
     chat: Chat,
     pretty: bool,
-    attachments: Vec<(String, Value)>,
+    attachments: Vec<Attachment>,
     /// Prompt parts of a request that failed, for /retry.
     failed: Option<Vec<Value>>,
     models: Arc<Mutex<Option<Vec<ModelInfo>>>>,
     editor: Editor<ReplHelper, DefaultHistory>,
+    edit_request: Arc<Mutex<Option<String>>>,
 }
 
 enum Flow {
@@ -144,13 +199,15 @@ enum Flow {
 
 impl Repl {
     pub fn new(
-        client: Client,
+        engine: Engine,
         cfg: Config,
         settings: RunSettings,
         chat: Chat,
         pretty: bool,
+        vim: bool,
     ) -> rustyline::Result<Repl> {
         let rl_cfg = RlConfig::builder()
+            .edit_mode(if vim { EditMode::Vi } else { EditMode::Emacs })
             .auto_add_history(false)
             .completion_type(rustyline::CompletionType::List)
             .max_history_size(2000)?
@@ -161,21 +218,50 @@ impl Repl {
         // Alt+Enter / Ctrl+J insert a newline instead of sending.
         editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::ALT), Cmd::Newline);
         editor.bind_sequence(KeyEvent::ctrl('J'), Cmd::Newline);
+        let edit_request = Arc::new(Mutex::new(None));
+        editor.bind_sequence(
+            KeyEvent::from('v'),
+            EventHandler::Conditional(Box::new(EditInEditor(edit_request.clone()))),
+        );
         let _ = editor.load_history(&config::input_history_path());
 
-        // Fetch the model list in the background: it feeds /model completion
-        // and tells us which models accept thinking settings.
-        let c = client.clone();
-        let m = models.clone();
-        thread::spawn(move || {
-            if let Ok(list) = c.list_models()
-                && let Ok(mut slot) = m.lock()
-            {
-                *slot = Some(list);
-            }
-        });
+        // API: fetch the model list in the background. It feeds /model
+        // completion and tells us which models accept thinking settings.
+        if let Engine::Api(client) = &engine {
+            let c = client.clone();
+            let m = models.clone();
+            thread::spawn(move || {
+                if let Ok(list) = c.list_models()
+                    && let Ok(mut slot) = m.lock()
+                {
+                    *slot = Some(list);
+                }
+            });
+        }
 
-        Ok(Repl { client, cfg, settings, chat, pretty, attachments: Vec::new(), failed: None, models, editor })
+        Ok(Repl {
+            engine: Some(engine),
+            cfg,
+            settings,
+            chat,
+            pretty,
+            attachments: Vec::new(),
+            failed: None,
+            models,
+            editor,
+            edit_request,
+        })
+    }
+
+    fn is_web(&self) -> bool {
+        matches!(self.engine, Some(Engine::Web(_)))
+    }
+
+    fn web(&mut self) -> Option<&mut WebEngine> {
+        match self.engine.as_mut() {
+            Some(Engine::Web(w)) => Some(w.as_mut()),
+            _ => None,
+        }
     }
 
     /// Run the input loop. `show_history` prints the end of a resumed chat first.
@@ -189,6 +275,17 @@ impl Repl {
             let styled = paint(fg(AnsiColor::BrightBlue).bold(), &prompt);
             match self.editor.readline(&(prompt.as_str(), styled.as_str())) {
                 Ok(line) => {
+                    let pending_edit = self.edit_request.lock().ok().and_then(|mut s| s.take());
+                    let line = match pending_edit {
+                        Some(draft) => match compose_in_editor(&draft) {
+                            Ok(text) => text,
+                            Err(e) => {
+                                render::error(&e);
+                                continue;
+                            }
+                        },
+                        None => line,
+                    };
                     let line = match self.read_continuation(line) {
                         Some(l) => l,
                         None => continue,
@@ -222,6 +319,9 @@ impl Repl {
             let _ = std::fs::create_dir_all(parent);
         }
         let _ = self.editor.save_history(&config::input_history_path());
+        if let Some(engine) = self.engine.take() {
+            engine.close();
+        }
         0
     }
 
@@ -268,9 +368,12 @@ impl Repl {
             paint(fg(AnsiColor::BrightBlue).bold(), "Google AI Studio CLI"),
             paint(dim(), env!("CARGO_PKG_VERSION"))
         ));
+        let via =
+            if self.is_web() { "AI Studio in your browser (signed-in Google account)" } else { "Gemini API (API key)" };
+        render::info(&format!("via {via}"));
         self.status_line();
         render::info(
-            "/help for commands · \"\"\" for multi-line input (or Alt+Enter) · Ctrl+C stops a response · Ctrl+D quits",
+            "/help for commands · \"\"\" or Alt+Enter for multi-line input · /edit opens $EDITOR · Ctrl+C stops a response · Ctrl+D quits",
         );
         render::out("\n");
     }
@@ -300,7 +403,11 @@ impl Repl {
     // -- chatting ---------------------------------------------------------
 
     fn send(&mut self, text: String) {
-        let mut parts: Vec<Value> = self.attachments.drain(..).map(|(_, p)| p).collect();
+        if self.is_web() {
+            self.web_send(text);
+            return;
+        }
+        let mut parts: Vec<Value> = self.attachments.drain(..).filter_map(|a| a.part).collect();
         if !text.trim().is_empty() {
             parts.push(conversation::user_text(&text));
         }
@@ -309,10 +416,56 @@ impl Repl {
         self.generate();
     }
 
+    /// Web: make the page's settings match, type the message, and stream the answer.
+    fn web_send(&mut self, text: String) {
+        let files: Vec<PathBuf> = self.attachments.iter().map(|a| a.path.clone()).collect();
+        let names: Vec<String> = self.attachments.drain(..).map(|a| a.name).collect();
+        let settings = self.settings.clone();
+        let pretty = self.pretty;
+        let Some(web) = self.web() else { return };
+        let page = match web.page.take() {
+            Some(p) => p,
+            None => web.session.read_settings(&settings),
+        };
+        for w in web.session.apply_settings(&page, &settings) {
+            render::warn(&format!("AI Studio: {w}"));
+        }
+        web.page = Some(settings.clone());
+        if let Err(e) = web.session.attach(&files) {
+            render::error(&format!("Could not attach files: {e}"));
+            return;
+        }
+        match web.session.send(&text, pretty, settings.include_thoughts, &settings.model) {
+            Ok(turn) => {
+                let mut parts: Vec<Value> = Vec::new();
+                if !text.trim().is_empty() {
+                    parts.push(conversation::user_text(&text));
+                }
+                parts.extend(names.iter().map(|n| json!({ "text": format!("[attachment: {n}]") })));
+                self.chat.contents.push(json!({ "role": "user", "parts": parts }));
+                if !turn.text.is_empty() {
+                    self.chat.contents.push(json!({ "role": "model", "parts": [ { "text": turn.text } ] }));
+                }
+                if turn.url.contains("/prompts/") && !turn.url.contains("new_chat") {
+                    self.chat.web_url = Some(turn.url);
+                }
+                self.save_chat();
+            }
+            Err(e) => {
+                render::error(&format!("Error: {e}"));
+                render::info("If the page looks different than expected, /debug saves a screenshot and its HTML.");
+            }
+        }
+    }
+
     fn generate(&mut self) {
+        let Some(Engine::Api(client)) = self.engine.as_ref() else {
+            render::warn("Not available with the web engine.");
+            return;
+        };
+        let client = client.clone();
         loop {
-            let result =
-                run_turn(&self.client, &self.settings, &self.chat.contents, self.supports_thinking(), self.pretty);
+            let result = run_turn(&client, &self.settings, &self.chat.contents, self.supports_thinking(), self.pretty);
             let result = match result {
                 Ok(r) => r,
                 Err(e) => {
@@ -454,6 +607,12 @@ impl Repl {
             "/help" | "/?" => self.help(),
             "/new" | "/clear" | "/reset" => {
                 self.save_chat();
+                if let Some(web) = self.web() {
+                    if let Err(e) = web.session.new_chat() {
+                        render::error(&e);
+                    }
+                    web.page = None;
+                }
                 self.chat = Chat::new(&self.settings);
                 self.attachments.clear();
                 self.failed = None;
@@ -478,17 +637,61 @@ impl Repl {
             "/tools" => self.print_tools(),
             "/safety" if arg.is_empty() => self.print_safety(),
             "/attach" | "/file" | "/upload" => self.cmd_attach(&arg),
+            "/edit" | "/e" => match compose_in_editor("") {
+                Ok(text) if !text.trim().is_empty() => {
+                    let _ = self.editor.add_history_entry(text.as_str());
+                    self.send(text);
+                }
+                Ok(_) => render::info("Empty message; nothing sent."),
+                Err(e) => render::error(&e),
+            },
+            "/vim" | "/vi" | "/emacs" => {
+                let on = if cmd == "/emacs" {
+                    false
+                } else {
+                    match settings::parse_bool(&arg, self.editor.config_mut().edit_mode() == EditMode::Vi) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            render::error(&e);
+                            return Flow::Continue;
+                        }
+                    }
+                };
+                self.editor.set_edit_mode(if on { EditMode::Vi } else { EditMode::Emacs });
+                self.cfg.edit_mode = Some(if on { "vi" } else { "emacs" }.to_string());
+                let _ = self.cfg.save();
+                render::success(if on {
+                    "Vim keybindings on (Esc for normal mode, `v` there opens $EDITOR)."
+                } else {
+                    "Emacs keybindings on."
+                });
+            }
+            "/debug" => match self.web() {
+                Some(web) => match web.session.debug_dump() {
+                    Ok(dir) => render::success(&format!(
+                        "Saved screenshot.png, page.html, outline.txt and state.json to {}\n(They contain this chat; check before sharing.)",
+                        dir.display()
+                    )),
+                    Err(e) => render::error(&e),
+                },
+                None => render::info("/debug is for the web engine."),
+            },
             "/detach" => {
                 self.attachments.clear();
                 render::success("Attachments removed.");
             }
             "/attachments" => {
-                for (name, _) in &self.attachments {
-                    render::out(&format!("  {name}\n"));
+                for a in &self.attachments {
+                    render::out(&format!("  {}\n", a.name));
                 }
                 if self.attachments.is_empty() {
                     render::info("No pending attachments.");
                 }
+            }
+            "/retry" | "/regenerate" | "/undo" if self.is_web() => {
+                render::info(
+                    "With the web engine, rerun or delete turns in AI Studio itself (aistudio login opens it).",
+                );
             }
             "/retry" | "/regenerate" => self.cmd_retry(),
             "/undo" => match self.chat.pop_exchange() {
@@ -518,9 +721,11 @@ impl Repl {
                         Ok(p) => render::success(&format!("API key saved to {}", p.display())),
                         Err(e) => render::error(&format!("could not save config: {e}")),
                     }
-                    match Client::new(key) {
-                        Ok(c) => self.client = c,
-                        Err(e) => render::error(&e.to_string()),
+                    if let Some(Engine::Api(client)) = self.engine.as_mut() {
+                        match Client::new(key) {
+                            Ok(c) => *client = c,
+                            Err(e) => render::error(&e.to_string()),
+                        }
                     }
                 }
             }
@@ -581,6 +786,26 @@ impl Repl {
 
     fn cmd_settings(&mut self, arg: &str) {
         match arg {
+            "save" if self.is_web() => {
+                self.cfg.web_settings = Some(self.settings.clone());
+                self.cfg.render = Some(if self.pretty { "markdown" } else { "raw" }.to_string());
+                match self.cfg.save() {
+                    Ok(p) => render::success(&format!("Saved; applied to AI Studio at every start ({}).", p.display())),
+                    Err(e) => render::error(&format!("could not save config: {e}")),
+                }
+            }
+            "reset" if self.is_web() => {
+                self.cfg.web_settings = None;
+                let _ = self.cfg.save();
+                let base = self.settings.clone();
+                if let Some(web) = self.web() {
+                    let page = web.session.read_settings(&base);
+                    web.page = Some(page.clone());
+                    self.settings = page;
+                }
+                render::success("Using AI Studio's own settings again (saved defaults removed).");
+                self.status_line();
+            }
             "save" => {
                 self.cfg.settings = self.settings.clone();
                 self.cfg.render = Some(if self.pretty { "markdown" } else { "raw" }.to_string());
@@ -650,18 +875,18 @@ impl Repl {
         if let Some(list) = self.models.lock().ok().and_then(|m| m.clone()) {
             return Some(list);
         }
-        match self.client.list_models() {
-            Ok(list) => {
-                if let Ok(mut slot) = self.models.lock() {
-                    *slot = Some(list.clone());
-                }
-                Some(list)
-            }
-            Err(e) => {
+        let fetched = match self.engine.as_mut() {
+            Some(Engine::Api(client)) => client.list_models().map_err(|e| {
                 self.report_api_error(&e);
-                None
-            }
+            }),
+            Some(Engine::Web(web)) => web.session.list_models().map_err(|e| render::error(&format!("Error: {e}"))),
+            None => Err(()),
+        };
+        let list = fetched.ok()?;
+        if let Ok(mut slot) = self.models.lock() {
+            *slot = Some(list.clone());
         }
+        Some(list)
     }
 
     fn chat_models(&mut self) -> Vec<ModelInfo> {
@@ -785,12 +1010,21 @@ impl Repl {
             return;
         }
         for p in paths {
-            let expanded = settings::shellexpand_home(&p);
-            match file_part(Path::new(&expanded)) {
+            let path = PathBuf::from(settings::shellexpand_home(&p));
+            if self.is_web() {
+                if path.is_file() {
+                    render::success(&format!("Attached {p}"));
+                    self.attachments.push(Attachment { name: p, path, part: None });
+                } else {
+                    render::error(&format!("no such file: {p}"));
+                }
+                continue;
+            }
+            match file_part(Path::new(&path)) {
                 Ok(part) => {
                     let mime = part["inlineData"]["mimeType"].as_str().unwrap_or("").to_string();
                     render::success(&format!("Attached {p} ({mime})"));
-                    self.attachments.push((p, part));
+                    self.attachments.push(Attachment { name: p, path, part: Some(part) });
                 }
                 Err(e) => render::error(&e),
             }
@@ -838,6 +1072,17 @@ impl Repl {
         match conversation::find_chat(arg) {
             Ok(chat) => {
                 self.save_chat();
+                if let Some(web) = self.web() {
+                    let Some(url) = chat.web_url.clone() else {
+                        render::error("That chat was made with the API engine; open it with `aistudio --api`.");
+                        return;
+                    };
+                    if let Err(e) = web.session.navigate(&url) {
+                        render::error(&e);
+                        return;
+                    }
+                    web.page = None;
+                }
                 self.settings = chat.settings.clone();
                 self.chat = chat;
                 self.attachments.clear();
@@ -869,17 +1114,16 @@ impl Repl {
     }
 
     fn cmd_code(&self) {
-        render::out(&get_code(&self.client, &self.settings, &self.chat.contents, self.supports_thinking()));
+        let url = match self.engine.as_ref() {
+            Some(Engine::Api(client)) => client.stream_url(&self.settings.model),
+            _ => format!("{DEFAULT_BASE_URL}/models/{}:streamGenerateContent?alt=sse", self.settings.model),
+        };
+        render::out(&get_code(&url, &self.settings, &self.chat.contents, self.supports_thinking()));
     }
 }
 
 /// The request as a curl command, like AI Studio's "Get code".
-pub fn get_code(
-    client: &Client,
-    settings: &RunSettings,
-    contents: &[Value],
-    supports_thinking: Option<bool>,
-) -> String {
+pub fn get_code(url: &str, settings: &RunSettings, contents: &[Value], supports_thinking: Option<bool>) -> String {
     let mut contents: Vec<Value> = contents.to_vec();
     for c in contents.iter_mut() {
         if let Some(parts) = c.get_mut("parts").and_then(Value::as_array_mut) {
@@ -896,9 +1140,39 @@ pub fn get_code(
     let body = settings.build_body(&contents, supports_thinking);
     format!(
         "curl \"{}\" \\\n  -H \"x-goog-api-key: $GEMINI_API_KEY\" \\\n  -H \"Content-Type: application/json\" \\\n  -X POST \\\n  -d @- <<'EOF'\n{}\nEOF\n",
-        client.stream_url(&settings.model),
+        url,
         serde_json::to_string_pretty(&body).unwrap_or_default()
     )
+}
+
+/// Write a message in $VISUAL / $EDITOR (vi, or Notepad on Windows) and return it.
+pub fn compose_in_editor(initial: &str) -> Result<String, String> {
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| std::env::var("EDITOR").ok().filter(|v| !v.trim().is_empty()))
+        .unwrap_or_else(|| if cfg!(windows) { "notepad".into() } else { "vi".into() });
+    let path = std::env::temp_dir().join(format!(
+        "aistudio-{}-{}.md",
+        std::process::id(),
+        chrono::Local::now().format("%H%M%S%f")
+    ));
+    std::fs::write(&path, initial).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    // Through the shell, so EDITOR may carry arguments (e.g. "code --wait").
+    #[cfg(windows)]
+    let status = std::process::Command::new("cmd").arg("/C").arg(format!("{editor} \"{}\"", path.display())).status();
+    #[cfg(not(windows))]
+    let status =
+        std::process::Command::new("sh").arg("-c").arg(format!("{editor} \"$1\"")).arg("sh").arg(&path).status();
+    let result = match status {
+        Ok(s) if s.success() => std::fs::read_to_string(&path)
+            .map(|t| t.trim_end().to_string())
+            .map_err(|e| format!("cannot read {}: {e}", path.display())),
+        Ok(s) => Err(format!("{editor} exited with {s}; nothing sent")),
+        Err(e) => Err(format!("cannot run {editor}: {e}")),
+    };
+    let _ = std::fs::remove_file(&path);
+    result
 }
 
 pub fn prompt_api_key() -> Option<String> {
